@@ -1,4 +1,3 @@
-import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import psycopg2
@@ -6,13 +5,15 @@ from psycopg2.extras import DictCursor
 import jwt
 import datetime
 from functools import wraps
+from werkzeug.utils import secure_filename
+import os
 from urllib.parse import urlparse
 
 app = Flask(__name__)
 CORS(app)
 
-# Database configuration
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://traffix_lg5f_user:ebJu1mTba1sem66WC9dyPJg8VlHgcZnU@dpg-cvknp22bo4c73f962r0-a/traffix_lg5f')
+# PostgreSQL configuration using Render's connection string
+DATABASE_URL = "postgresql://traffix_lg5f_user:ebJu1mTba1sem66WC9dyPJg8VlHgcZnU@dpg-cvknp82dbo4c73f962r0-a.oregon-postgres.render.com/traffix_lg5f"
 
 # Parse the database URL
 result = urlparse(DATABASE_URL)
@@ -20,9 +21,10 @@ username = result.username
 password = result.password
 database = result.path[1:]
 hostname = result.hostname
-port = result.port
 
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif'}
 
 def get_db_connection():
     conn = psycopg2.connect(
@@ -30,11 +32,15 @@ def get_db_connection():
         user=username,
         password=password,
         host=hostname,
-        port=port
+        cursor_factory=DictCursor
     )
     return conn
 
 # Helper functions
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -49,8 +55,8 @@ def token_required(f):
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
             current_user = get_user_by_id(data['user_id'])
-        except Exception as e:
-            return jsonify({'message': 'Token is invalid!', 'error': str(e)}), 401
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 401
             
         return f(current_user, *args, **kwargs)
         
@@ -58,14 +64,14 @@ def token_required(f):
 
 def get_user_by_id(user_id):
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
+    cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
     user = cur.fetchone()
     cur.close()
     conn.close()
     return user
 
-# Auth Routes
+# Routes
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -79,12 +85,13 @@ def register():
     cur = conn.cursor()
     
     try:
-        # Check if email exists
         cur.execute("SELECT id FROM users WHERE email = %s", (data['email'],))
         if cur.fetchone():
             return jsonify({'message': 'Email already exists!'}), 400
         
-        # Insert new user (in production, hash the password)
+        # Store plain text password (in production, use hashing)
+        hashed_password = data['password']
+        
         cur.execute("""
             INSERT INTO users 
             (name, email, phone, password_hash, role, license_plate, vehicle_type, cin) 
@@ -94,27 +101,20 @@ def register():
             data['name'],
             data['email'],
             data['phone'],
-            data['password'],  # In production: generate_password_hash(data['password'])
+            hashed_password,
             data['license_plate'],
             data['vehicle_type'],
             data['cin']
         ))
-        
-        user_id = cur.fetchone()[0]
+        user_id = cur.fetchone()['id']
         conn.commit()
         
-        # Generate JWT token
         token = jwt.encode({
             'user_id': user_id,
             'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
         }, app.config['SECRET_KEY'])
         
-        return jsonify({
-            'token': token,
-            'user_id': user_id,
-            'message': 'User registered successfully'
-        }), 201
-        
+        return jsonify({'token': token, 'user_id': user_id}), 201
     except Exception as e:
         conn.rollback()
         return jsonify({'message': str(e)}), 500
@@ -130,56 +130,45 @@ def login():
         return jsonify({'message': 'Identifier and password are required!'}), 400
     
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
+    cur = conn.cursor()
     
     try:
-        cur.execute("""
-            SELECT * FROM users 
-            WHERE email = %s OR badge_number = %s
-        """, (data['identifier'], data['identifier']))
+        cur.execute("SELECT * FROM users WHERE email = %s OR badge_number = %s", 
+                   (data['identifier'], data['identifier']))
         user = cur.fetchone()
         
         if not user:
             return jsonify({'message': 'Invalid credentials!'}), 401
         
-        # In production: check_password_hash(user['password_hash'], data['password'])
+        # Compare plain text passwords (in production, use hashing)
         if data['password'] != user['password_hash']:
             return jsonify({'message': 'Invalid credentials!'}), 401
         
-        # Generate token
         token = jwt.encode({
             'user_id': user['id'],
             'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
         }, app.config['SECRET_KEY'])
         
-        # Remove password before returning
-        user.pop('password_hash')
+        user_dict = dict(user)
+        user_dict.pop('password_hash', None)
         
-        return jsonify({
-            'token': token,
-            'user': user,
-            'message': 'Login successful'
-        })
-        
-    except Exception as e:
-        return jsonify({'message': str(e)}), 500
+        return jsonify({'token': token, 'user': user_dict})
     finally:
         cur.close()
         conn.close()
 
-# User Routes
 @app.route('/api/user', methods=['GET'])
 @token_required
 def get_current_user(current_user):
-    current_user.pop('password_hash', None)
-    return jsonify(current_user)
+    user_dict = dict(current_user)
+    user_dict.pop('password_hash', None)
+    return jsonify(user_dict)
 
-# Violation Routes
 @app.route('/api/violations', methods=['GET'])
 @token_required
 def get_violations(current_user):
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
+    cur = conn.cursor()
     
     try:
         if current_user['role'] == 'police':
@@ -200,9 +189,6 @@ def get_violations(current_user):
         
         violations = cur.fetchall()
         return jsonify(violations)
-        
-    except Exception as e:
-        return jsonify({'message': str(e)}), 500
     finally:
         cur.close()
         conn.close()
@@ -213,45 +199,57 @@ def create_violation(current_user):
     if current_user['role'] != 'police':
         return jsonify({'message': 'Only police officers can create violations!'}), 403
     
-    data = request.get_json()
-    required_fields = ['license_plate', 'violation_type', 'location', 'violation_date', 'fine_amount']
-    
-    missing_fields = [field for field in required_fields if field not in data]
-    if missing_fields:
-        return jsonify({'message': f'Missing fields: {", ".join(missing_fields)}'}), 400
-    
     conn = get_db_connection()
     cur = conn.cursor()
     
     try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['license_plate', 'violation_type', 'location', 
+                         'violation_date', 'fine_amount', 'insurance_policy']
+        
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return jsonify({'message': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+        
+        license_plate = data['license_plate'].strip().upper()
+        violation_type = data['violation_type']
+        location = data['location']
+        notes = data.get('notes', '')
+        violation_date = data['violation_date']
+        fine_amount = float(data['fine_amount'])
+        insurance_policy = data['insurance_policy']
+        
         # Get vehicle owner info if exists
         cur.execute("""
             SELECT id, name FROM users 
             WHERE license_plate = %s AND role = 'civil'
-        """, (data['license_plate'].upper(),))
+        """, (license_plate,))
         owner = cur.fetchone()
+        
+        owner_id = owner['id'] if owner else None
+        owner_name = owner['name'] if owner else 'Unknown'
         
         # Create violation
         cur.execute("""
             INSERT INTO violations 
-            (license_plate, owner_name, violation_type, violation_date, 
-             location, fine_amount, notes, officer_id, insurance_policy)
+            (license_plate, owner_name, insurance_policy, violation_type, 
+             violation_date, location, fine_amount, notes, officer_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
-            data['license_plate'].upper(),
-            owner['name'] if owner else 'Unknown',
-            data['violation_type'],
-            data['violation_date'],
-            data['location'],
-            float(data['fine_amount']),
-            data.get('notes', ''),
-            current_user['id'],
-            data.get('insurance_policy', '')
+            license_plate,
+            owner_name,
+            insurance_policy,
+            violation_type,
+            violation_date,
+            location,
+            fine_amount,
+            notes,
+            current_user['id']
         ))
-        
-        violation_id = cur.fetchone()[0]
-        conn.commit()
+        violation_id = cur.fetchone()['id']
         
         # Create notification if owner exists
         if owner:
@@ -261,17 +259,17 @@ def create_violation(current_user):
                 VALUES (%s, 'New Violation', %s)
             """, (
                 owner['id'],
-                f"New {data['violation_type']} violation recorded for your vehicle"
+                f"New {violation_type} violation recorded for your vehicle {license_plate}. Fine: {fine_amount} DZD"
             ))
-            conn.commit()
         
+        conn.commit()
         return jsonify({
-            'message': 'Violation created successfully',
+            'message': 'Violation created successfully!', 
             'violation_id': violation_id
         }), 201
         
-    except ValueError:
-        return jsonify({'message': 'Invalid fine amount'}), 400
+    except ValueError as e:
+        return jsonify({'message': 'Invalid fine amount format'}), 400
     except Exception as e:
         conn.rollback()
         return jsonify({'message': str(e)}), 500
@@ -279,56 +277,86 @@ def create_violation(current_user):
         cur.close()
         conn.close()
 
-@app.route('/api/violations/<int:violation_id>/pay', methods=['PUT'])
+@app.route('/api/violations/<int:violation_id>/pay', methods=['PUT', 'OPTIONS'])
 @token_required
 def pay_violation(current_user, violation_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'preflight'}), 200
     
+    conn = None
+    cur = None
     try:
-        # Verify violation belongs to user
-        cur.execute("""
-            SELECT id FROM violations 
-            WHERE id = %s AND license_plate = %s
-        """, (violation_id, current_user['license_plate']))
+        conn = get_db_connection()
+        cur = conn.cursor()
         
-        if not cur.fetchone():
-            return jsonify({'message': 'Violation not found or not yours to pay!'}), 404
+        # 1. First verify the violation exists
+        cur.execute("SELECT id, license_plate FROM violations WHERE id = %s", (violation_id,))
+        violation = cur.fetchone()
         
-        # Update paid status
+        if not violation:
+            return jsonify({'error': 'Violation not found'}), 404
+        
+        # 2. Verify the violation belongs to the current user
+        if violation['license_plate'] != current_user['license_plate']:
+            return jsonify({
+                'error': 'Violation does not belong to user',
+                'user_plate': current_user['license_plate'],
+                'violation_plate': violation['license_plate']
+            }), 403
+        
+        # 3. Attempt payment
         cur.execute("""
             UPDATE violations 
-            SET paid = TRUE
+            SET paid = TRUE, payment_date = NOW() 
             WHERE id = %s
+            RETURNING id, paid, payment_date
         """, (violation_id,))
-        conn.commit()
         
-        # Create payment notification
+        updated_violation = cur.fetchone()
+        
+        # 4. Create notification
         cur.execute("""
             INSERT INTO notifications 
-            (user_id, title, message)
-            VALUES (%s, 'Payment Confirmed', 'Violation payment received')
-        """, (current_user['id'],))
+            (user_id, title, message, created_at)
+            VALUES (%s, %s, %s, NOW())
+            RETURNING id
+        """, (
+            current_user['id'],
+            'Payment Confirmed',
+            f'Payment received for violation #{violation_id}'
+        ))
+        
         conn.commit()
         
-        return jsonify({'message': 'Violation paid successfully'})
+        return jsonify({
+            'message': 'Payment successful',
+            'violation_id': violation_id,
+            'paid_status': updated_violation['paid'],
+            'payment_date': updated_violation['payment_date']
+        })
         
     except Exception as e:
-        conn.rollback()
-        return jsonify({'message': str(e)}), 500
+        if conn:
+            conn.rollback()
+        return jsonify({
+            'error': 'Database operation failed',
+            'details': str(e),
+            'violation_id': violation_id,
+            'user_id': current_user.get('id'),
+            'user_plate': current_user.get('license_plate')
+        }), 500
     finally:
-        cur.close()
-        conn.close()
-
-# Notification Routes
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 @app.route('/api/notifications', methods=['GET'])
 @token_required
 def get_notifications(current_user):
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
+    cur = conn.cursor()
     
     try:
-        # Get notifications
         cur.execute("""
             SELECT * FROM notifications 
             WHERE user_id = %s
@@ -336,7 +364,7 @@ def get_notifications(current_user):
         """, (current_user['id'],))
         notifications = cur.fetchall()
         
-        # Mark as read
+        # Mark as read when fetched
         cur.execute("""
             UPDATE notifications 
             SET is_read = TRUE 
@@ -361,15 +389,9 @@ def delete_notification(current_user, notification_id):
         cur.execute("""
             DELETE FROM notifications 
             WHERE id = %s AND user_id = %s
-            RETURNING id
         """, (notification_id, current_user['id']))
-        
-        if not cur.fetchone():
-            conn.rollback()
-            return jsonify({'message': 'Notification not found'}), 404
-        
         conn.commit()
-        return jsonify({'message': 'Notification deleted'})
+        return jsonify({'message': 'Notification deleted successfully!'})
     except Exception as e:
         conn.rollback()
         return jsonify({'message': str(e)}), 500
@@ -378,5 +400,4 @@ def delete_notification(current_user, notification_id):
         conn.close()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(debug=True)
